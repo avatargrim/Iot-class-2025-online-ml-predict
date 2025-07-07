@@ -1,0 +1,9 @@
+joblib
+numpy
+pandas
+python-dotenv
+quixstreams
+scikit-learn==1.7.0
+scipy==1.15.3
+influxdb_client
+river

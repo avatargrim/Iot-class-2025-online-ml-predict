@@ -1,6 +1,6 @@
 import os
 import logging
-import joblib  # For saving/loading the model
+import joblib
 import json
 from datetime import datetime, timezone
 from river import tree, preprocessing, metrics
@@ -8,7 +8,7 @@ from quixstreams import Application
 from dotenv import load_dotenv
 from influxdb_client import InfluxDBClient, Point, WriteOptions
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv(".env")
 
 # Configure logging
@@ -20,11 +20,11 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# Load configurations
+# Load configs
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
-KAFKA_INPUT_TOPIC = os.getenv("KAFKA_INPUT_TOPIC", "event-frames-model")
-KAFKA_OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "fan-speed-prediction")
-MODEL_LOCATION = os.getenv("MODEL_LOCATION", "/app/fan_speed_model.pkl")
+KAFKA_INPUT_TOPIC = os.getenv("KAFKA_INPUT_TOPIC", "6510301032_AQ")
+KAFKA_OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "aqi-prediction")
+MODEL_LOCATION = os.getenv("MODEL_LOCATION", "/app/aqi_model.pkl")
 
 INFLUX_URL = os.getenv("INFLUX_URL")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
@@ -40,7 +40,7 @@ except Exception as e:
     logging.error(f"❌ Failed to initialize InfluxDB client: {e}")
     exit(1)
 
-# Load or initialize the online model
+# Load or initialize model
 if os.path.exists(MODEL_LOCATION):
     model = joblib.load(MODEL_LOCATION)
     logging.info(f"✅ Loaded model from {MODEL_LOCATION}")
@@ -48,21 +48,20 @@ else:
     model = preprocessing.StandardScaler() | tree.HoeffdingTreeClassifier()
     logging.info(f"📦 Initialized new model")
 
-# Metrics for evaluation
+# Metrics
 metric_acc = metrics.Accuracy()
 metric_mae = metrics.MAE()
 
-# Record counter for triggering model save
-counter = 0
+counter = 0  # record counter
 
-# Setup QuixStreams application
+# Setup QuixStreams app
 try:
     app = Application(
         broker_address=KAFKA_BROKER,
         loglevel="INFO",
         auto_offset_reset="earliest",
         state_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "state"),
-        consumer_group="predict-from-kafka-online"
+        consumer_group="predict-aqi-online"
     )
     input_topic = app.topic(KAFKA_INPUT_TOPIC, value_deserializer="json")
     producer = app.get_producer()
@@ -72,72 +71,63 @@ except Exception as e:
     logging.error(f"❌ Failed to setup QuixStreams application or topics: {e}")
     exit(1)
 
-# Handler function to process each message from Kafka
+# Message handler
 def handle_message(data):
     global counter
     try:
         sensor_name = data.get("name", "")
         payload = data.get("payload", {})
+
+        # Features
         x = {
-            "temperature": payload["temperature"],
-            "humidity": payload["humidity"],
-            "pressure": payload["pressure"]
+            "CO": payload["CO"],
+            "NO2": payload["NO2"],
+            "SO2": payload["SO2"],
+            "O3": payload["O3"],
+            "PM2_5": payload["PM2.5"],
+            "PM10": payload["PM10"]
         }
-        
-        # Make prediction before learning
+
+        # Prediction
         prediction = model.predict_one(x)
 
-        # Convert timestamp to datetime (UTC)
+        # Timestamp
         timestamp = datetime.fromtimestamp(
             payload.get("timestamp", datetime.now().timestamp() * 1000) / 1000.0,
             tz=timezone.utc
         )
 
-        if sensor_name == "iot_sensor_0":
-            actual_fan_speed = payload.get("fan_speed", None)
-            if actual_fan_speed is not None:
-                # Update the model with true value
-                model.learn_one(x, actual_fan_speed)
+        actual_aqi = payload.get("AQI", None)
 
-                # Update metrics
-                metric_acc.update(actual_fan_speed, prediction)
-                metric_mae.update(actual_fan_speed, prediction)
+        if actual_aqi is not None:
+            # Learn
+            model.learn_one(x, actual_aqi)
+            # Update metrics
+            metric_acc.update(actual_aqi, prediction)
+            metric_mae.update(actual_aqi, prediction)
+            logging.info(f"🔍 Predict={prediction}, Target={actual_aqi}, Acc={metric_acc.get():.3f}, MAE={metric_mae.get():.3f}")
 
-                logging.info(f"🔍[Model Sensor] {sensor_name} Predict={prediction}, Target={actual_fan_speed}, Acc={metric_acc.get():.3f}, MAE={metric_mae.get():.3f}")
+            # Save model every 10 records
+            counter += 1
+            if counter % 10 == 0:
+                joblib.dump(model, MODEL_LOCATION)
+                logging.info(f"💾 Model saved after {counter} records to {MODEL_LOCATION}")
+                counter = 0
 
-                # Save the model every 10 records
-                counter += 1
-                if counter % 10 == 0:
-                    joblib.dump(model, MODEL_LOCATION)
-                    logging.info(f"💾 Model saved after {counter} records to {MODEL_LOCATION}")
-                    counter = 0
-            else:
-                logging.warning("[Model Sensor] fan_speed not found in payload")
-                logging.warning(f"📥 First learn only: Target={actual_fan_speed}")
+        # Build output payload
+        result_payload = {
+            "CO": payload["CO"],
+            "NO2": payload["NO2"],
+            "SO2": payload["SO2"],
+            "O3": payload["O3"],
+            "PM2_5": payload["PM2.5"],
+            "PM10": payload["PM10"],
+            "AQI": int(actual_aqi) if actual_aqi is not None else None,
+            "AQI_predicted": int(prediction),
+            "timestamp": int(timestamp.timestamp() * 1000),
+            "date": timestamp.isoformat()
+        }
 
-            # Build output payload including actual and predicted values
-            result_payload = {
-                "temperature": payload["temperature"],
-                "humidity": payload["humidity"],
-                "pressure": payload["pressure"],
-                "fan_speed": int(actual_fan_speed) if actual_fan_speed is not None else None,
-                "fan_speed_predicted": int(prediction),
-                "timestamp": int(timestamp.timestamp() * 1000),
-                "date": timestamp.isoformat()
-            }
-
-        else:
-            # For other sensors (only prediction)
-            result_payload = {
-                "temperature": payload["temperature"],
-                "humidity": payload["humidity"],
-                "pressure": payload["pressure"],
-                "fan_speed_predicted": int(prediction),
-                "timestamp": int(timestamp.timestamp() * 1000),
-                "date": timestamp.isoformat()
-            }
-
-        # Compose final Kafka message
         result = {
             "id": data.get("id", ""),
             "name": sensor_name,
@@ -147,7 +137,7 @@ def handle_message(data):
 
         new_payload = json.dumps(result).encode('utf-8')
 
-        # Send result to Kafka output topic
+        # Send to Kafka output
         producer.produce(
             topic=output_topic.name,
             key=sensor_name,
@@ -156,13 +146,13 @@ def handle_message(data):
         )
         logging.info(f"[📤] Sent prediction to Kafka topic: {KAFKA_OUTPUT_TOPIC}, payload: {json.dumps(result)}")
 
-        # Write only prediction to InfluxDB
+        # Write prediction to InfluxDB
         point = (
-            Point("fan_speed_prediction")
+            Point("aqi_prediction")
             .tag("sensor_id", data.get("id", "unknown"))
             .tag("place_id", data.get("place_id", "unknown"))
             .tag("name", sensor_name)
-            .field("fan_speed_predicted", int(prediction))
+            .field("AQI_predicted", int(prediction))
             .time(timestamp)
         )
         influx_writer.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
@@ -173,11 +163,11 @@ def handle_message(data):
     except Exception as e:
         logging.error(f"❌ Error processing message: {e}")
 
-# Apply the message handler to Kafka dataframe stream
+# Apply handler
 sdf = app.dataframe(input_topic)
 sdf = sdf.apply(handle_message)
 
-# Start application
+# Run app
 logging.info(f"Connecting to ...{KAFKA_BROKER}")
 logging.info(f"🚀 Listening to Kafka topic: {KAFKA_INPUT_TOPIC}")
 app.run()

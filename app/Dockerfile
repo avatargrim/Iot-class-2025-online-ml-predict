@@ -26,3 +26,4 @@ WORKDIR "/app/${MAINAPPPATH}"
 			
 # Define the container's startup command
 ENTRYPOINT ["python3", "main.py"]
+

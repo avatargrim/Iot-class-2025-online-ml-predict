@@ -3,7 +3,7 @@ import logging
 import joblib
 import json
 from datetime import datetime, timezone
-from river import tree, preprocessing, metrics
+from river import preprocessing, metrics, ensemble
 from quixstreams import Application
 from dotenv import load_dotenv
 from influxdb_client import InfluxDBClient, Point, WriteOptions
@@ -24,7 +24,7 @@ logging.basicConfig(
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
 KAFKA_INPUT_TOPIC = os.getenv("KAFKA_INPUT_TOPIC", "6510301032_AQ")
 KAFKA_OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "aqi-prediction")
-MODEL_LOCATION = os.getenv("MODEL_LOCATION", "/app/aqi_model.pkl")
+MODEL_LOCATION = os.getenv("MODEL_LOCATION", "/app/aqi_model_forest.pkl")
 
 INFLUX_URL = os.getenv("INFLUX_URL")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
@@ -40,17 +40,23 @@ except Exception as e:
     logging.error(f"❌ Failed to initialize InfluxDB client: {e}")
     exit(1)
 
-# Load or initialize model
+# Initialize river model (Adaptive Random Forest Regressor with tuning)
 if os.path.exists(MODEL_LOCATION):
     model = joblib.load(MODEL_LOCATION)
-    logging.info(f"✅ Loaded model from {MODEL_LOCATION}")
+    logging.info(f"✅ Loaded AdaptiveRandomForestRegressor model from {MODEL_LOCATION}")
 else:
-    model = preprocessing.StandardScaler() | tree.HoeffdingTreeClassifier()
-    logging.info(f"📦 Initialized new model")
+    model = preprocessing.StandardScaler() | ensemble.AdaptiveRandomForestRegressor(
+        n_models=30,       # จำนวนต้นไม้ (มากขึ้นแม่นยำขึ้น)
+        max_depth=20,      # จำกัดความลึกปานกลาง ลด overfitting
+        max_features=3,    # สุ่มฟีเจอร์ช่วยลด correlation
+        seed=42            # reproducible
+    )
+    logging.info(f"📦 Initialized new AdaptiveRandomForestRegressor model")
 
 # Metrics
-metric_acc = metrics.Accuracy()
 metric_mae = metrics.MAE()
+metric_rmse = metrics.RMSE()
+metric_r2 = metrics.R2()
 
 counter = 0  # record counter
 
@@ -88,7 +94,7 @@ def handle_message(data):
             "PM10": payload["PM10"]
         }
 
-        # Prediction
+        # Prediction (river forest)
         prediction = model.predict_one(x)
 
         # Timestamp
@@ -100,18 +106,22 @@ def handle_message(data):
         actual_aqi = payload.get("AQI", None)
 
         if actual_aqi is not None:
-            # Learn
+            # Online learning
             model.learn_one(x, actual_aqi)
             # Update metrics
-            metric_acc.update(actual_aqi, prediction)
             metric_mae.update(actual_aqi, prediction)
-            logging.info(f"🔍 Predict={prediction}, Target={actual_aqi}, Acc={metric_acc.get():.3f}, MAE={metric_mae.get():.3f}")
+            metric_rmse.update(actual_aqi, prediction)
+            metric_r2.update(actual_aqi, prediction)
+            logging.info(
+                f"🌲 Predict={prediction:.2f}, Target={actual_aqi}, "
+                f"MAE={metric_mae.get():.3f}, RMSE={metric_rmse.get():.3f}, R²={metric_r2.get():.3f}"
+            )
 
-            # Save model every 10 records
+            # Save model every 50 records
             counter += 1
-            if counter % 10 == 0:
+            if counter % 50 == 0:
                 joblib.dump(model, MODEL_LOCATION)
-                logging.info(f"💾 Model saved after {counter} records to {MODEL_LOCATION}")
+                logging.info(f"💾 Forest model saved after {counter} records to {MODEL_LOCATION}")
                 counter = 0
 
         # Build output payload
@@ -123,7 +133,7 @@ def handle_message(data):
             "PM2_5": payload["PM2.5"],
             "PM10": payload["PM10"],
             "AQI": int(actual_aqi) if actual_aqi is not None else None,
-            "AQI_predicted": int(prediction),
+            "AQI_predicted": float(prediction) if prediction is not None else None,
             "timestamp": int(timestamp.timestamp() * 1000),
             "date": timestamp.isoformat()
         }
@@ -147,16 +157,17 @@ def handle_message(data):
         logging.info(f"[📤] Sent prediction to Kafka topic: {KAFKA_OUTPUT_TOPIC}, payload: {json.dumps(result)}")
 
         # Write prediction to InfluxDB
-        point = (
-            Point("aqi_prediction")
-            .tag("sensor_id", data.get("id", "unknown"))
-            .tag("place_id", data.get("place_id", "unknown"))
-            .tag("name", sensor_name)
-            .field("AQI_predicted", int(prediction))
-            .time(timestamp)
-        )
-        influx_writer.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
-        logging.info("[📊] Wrote prediction to InfluxDB")
+        if prediction is not None:
+            point = (
+                Point("aqi_prediction")
+                .tag("sensor_id", data.get("id", "unknown"))
+                .tag("place_id", data.get("place_id", "unknown"))
+                .tag("name", sensor_name)
+                .field("AQI_predicted", float(prediction))
+                .time(timestamp)
+            )
+            influx_writer.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+            logging.info("[📊] Wrote prediction to InfluxDB")
 
     except KeyError as e:
         logging.error(f"❌ Missing key in payload: {e}")

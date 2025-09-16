@@ -3,7 +3,7 @@ import logging
 import joblib
 import json
 from datetime import datetime, timezone
-from river import preprocessing, metrics, ensemble
+from river import tree, preprocessing, metrics, ensemble
 from quixstreams import Application
 from dotenv import load_dotenv
 from influxdb_client import InfluxDBClient, Point, WriteOptions
@@ -24,7 +24,7 @@ logging.basicConfig(
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
 KAFKA_INPUT_TOPIC = os.getenv("KAFKA_INPUT_TOPIC", "6510301032_AQ")
 KAFKA_OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "aqi-prediction")
-MODEL_LOCATION = os.getenv("MODEL_LOCATION", "/app/aqi_model_forest.pkl")
+MODEL_LOCATION = os.getenv("MODEL_LOCATION", "/app/aqi_model.pkl")
 
 INFLUX_URL = os.getenv("INFLUX_URL")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
@@ -40,23 +40,18 @@ except Exception as e:
     logging.error(f"❌ Failed to initialize InfluxDB client: {e}")
     exit(1)
 
-# Initialize river model (Adaptive Random Forest Regressor with tuning)
+# Initialize river model (regressor)
 if os.path.exists(MODEL_LOCATION):
     model = joblib.load(MODEL_LOCATION)
-    logging.info(f"✅ Loaded AdaptiveRandomForestRegressor model from {MODEL_LOCATION}")
+    logging.info(f"✅ Loaded river model from {MODEL_LOCATION}")
 else:
-    model = preprocessing.StandardScaler() | ensemble.AdaptiveRandomForestRegressor(
-        n_models=30,       # จำนวนต้นไม้ (มากขึ้นแม่นยำขึ้น)
-        max_depth=20,      # จำกัดความลึกปานกลาง ลด overfitting
-        max_features=3,    # สุ่มฟีเจอร์ช่วยลด correlation
-        seed=42            # reproducible
-    )
-    logging.info(f"📦 Initialized new AdaptiveRandomForestRegressor model")
+    model = preprocessing.StandardScaler() | tree.HoeffdingTreeRegressor()
+    # หรือใช้ ensemble.AdaptiveRandomForestRegressor() ก็ได้
+    logging.info(f"📦 Initialized new river regressor model")
 
 # Metrics
 metric_mae = metrics.MAE()
 metric_rmse = metrics.RMSE()
-metric_r2 = metrics.R2()
 
 counter = 0  # record counter
 
@@ -94,7 +89,7 @@ def handle_message(data):
             "PM10": payload["PM10"]
         }
 
-        # Prediction (river forest)
+        # Prediction (river)
         prediction = model.predict_one(x)
 
         # Timestamp
@@ -111,17 +106,16 @@ def handle_message(data):
             # Update metrics
             metric_mae.update(actual_aqi, prediction)
             metric_rmse.update(actual_aqi, prediction)
-            metric_r2.update(actual_aqi, prediction)
             logging.info(
-                f"🌲 Predict={prediction:.2f}, Target={actual_aqi}, "
-                f"MAE={metric_mae.get():.3f}, RMSE={metric_rmse.get():.3f}, R²={metric_r2.get():.3f}"
+                f"🔍 Predict={prediction:.2f}, Target={actual_aqi}, "
+                f"MAE={metric_mae.get():.3f}, RMSE={metric_rmse.get():.3f}"
             )
 
             # Save model every 50 records
             counter += 1
             if counter % 50 == 0:
                 joblib.dump(model, MODEL_LOCATION)
-                logging.info(f"💾 Forest model saved after {counter} records to {MODEL_LOCATION}")
+                logging.info(f"💾 River model saved after {counter} records to {MODEL_LOCATION}")
                 counter = 0
 
         # Build output payload
